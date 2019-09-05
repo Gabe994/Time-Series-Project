@@ -1,0 +1,449 @@
+---
+title: "Streaming & Time Series Project"
+author: "Luca Gabellini"
+date: "13 giugno 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(encoding = 'UTF-8')
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+require(xts)
+library(forecast)
+library(lmtest)
+library(FitAR)
+library(ggplot2)
+require(KFAS)
+require(tsfknn)
+library(ggpubr)
+require(MLmetrics)
+```
+
+Verranno analizzati dei dati sperimentali riguardanti il consumo di energia di elettrodomestici in un edificio a basso consumo energetico.
+
+```{r}
+data=read.csv("C:\\Users\\Luca\\Desktop\\BICOCCA\\streaming & time series\\progetto\\energydata_complete.csv",
+                 stringsAsFactors = F)
+```
+
+Preprocessing
+
+```{r}
+###Appliances
+#seleziono le colonne di interesse
+df=data[,1:2]
+#trasformo il campo date
+class(df$date)
+df$date=strptime(df$date,format="%Y-%m-%d %H:%M:%S")
+class(df$date)
+#ora devo aggregare per fascia oraria: 6 obs per ogni ora
+#prima rimuovo l'ultima osservazione, che ha un solo valore orario al posto di 6
+df=df[-(dim(df)[1]),]
+```
+```{r}
+#aggrego i dati per fascia oraria
+df2=aggregate(df[,'Appliances'], 
+                 by=list(hour=cut(as.POSIXct(df$date), "hour")),
+                 FUN=sum)
+names(df2)=c("Date","Appliances")
+head(df2)
+```
+
+```{r}
+serie=xts(df2$Appliances,order.by=as.POSIXct(df2$Date,format="%Y-%m-%d %H:%M:%S"))
+plot(serie)
+```
+
+Seguendo lo schema classico, valuto se sussiste una relazione tra media e varianza a livello locale.
+
+```{r}
+medie <- tapply(serie,
+                as.Date(index(serie)),  
+                mean)
+
+stdev <- tapply(serie,
+                as.Date(index(serie)),
+                sd)
+
+plot(medie, stdev)
+abline(-200,1, col='red')
+```
+
+La relazione di linearità è evidente: applico il logaritmo
+
+```{r warning=FALSE, fig.keep='last'}
+lserie=log(serie)
+plot(lserie)
+lines(xts(rep(mean(lserie),length(lserie)),order.by=as.POSIXct(df2$Date,format="%Y-%m-%d %H:%M:%S")),col='red')
+```
+
+Dal plot della serie si possono trarre alcune osservazioni:<br>
+- Non sembra esserci un trend positivo o negativo;<br>
+- Sono evidenti due cali sostanziali di energia a fine gennaio e a inizio aprile;<br>
+- La stazionarietà sui primi due momenti, ad occhio, sembra rispettata.<br>
+
+Si può quindi procedere nell'analisi, non prima di dividere il dataset in train e test:
+
+```{r}
+#Divido in train e test: train conterrà i primi 3 mesi, 
+#test il rimanente mese e mezzo
+cutoff=which(df2['Date']=='2016-04-01 00:00:00')
+test=df2[cutoff:dim(df2)[1],]
+train=df2[1:(cutoff-1),]
+#ritrasformo il train in una serie storica
+s_train=xts(train$Appliances,order.by=as.POSIXct(train$Date,format="%Y-%m-%d %H:%M:%S"))
+ltrain=log(s_train)
+```
+
+Definisco funzione per plottare assieme acf e pacf, vista a lezione:
+
+```{r}
+
+acfpacf <- function(x, max.lag=36){
+  par(mfrow = c(2,1))
+  Acf(x, max.lag ,main='')
+  Pacf(x, max.lag, main='')
+  par(mfrow = c(1,1))
+}
+```
+
+Ipotizzando che, dopo la trasformazione logaritmica la serie sia ora stazionaria,
+analizzo acf e pacf:
+
+```{r}
+acfpacf(ltrain)
+```
+
+L'acf presenta un andamento sinusoidale, che è indice della probabile presenza di una radice complessa. La pacf vede i primi quattro ritardi uscire dalle bande.
+Si opta per un modello AR di ordine 2, dato che solo le prime due autocorrelazioni parziali escono in maniera evidente dalle bande.
+
+```{r}
+mod1 <- Arima(ltrain, c(2, 0, 0), c(0, 0, 0))
+coeftest(mod1)
+```
+
+```{r}
+acfpacf(mod1$residuals,50)
+```
+
+Dai plot acf e pacf sui residui del modello sembra esserci una stagionalità 
+giornaliera (ogni 24 h).
+La parte non stagionale sembra sistemata.<br>
+Proviamo ad aumentare il numero di residui:
+```{r}
+acfpacf(mod1$residuals,200)
+```
+
+La stagionalità giornaliera è ancora più evidente.<br>
+Si opta per una differenziazione stagionale:
+```{r}
+mod2 <- Arima(ltrain, order=c(2, 0, 0), seasonal=list(order=c(0, 1, 0), period=24))
+coeftest(mod2)
+```
+
+```{r}
+acfpacf(mod2$residuals,100)
+```
+
+L'acf si annulla dopo il primo ritardo stagionale, la pacf decresce geometricamente: 
+è evidente la presenza di un processo stagionale a media mobile (sma(1)).
+
+```{r}
+mod3 <- Arima(ltrain, order=c(2, 0, 0), seasonal=list(order=c(0, 1, 1), period=24))
+coeftest(mod3)
+```
+
+```{r}
+acfpacf(mod3$residuals,400)
+```
+
+Anche se l'acf presenta ancora memoria stagionale
+In particolare l'acf sembra presentare un decadimento geometrico su alcuni ritardi
+Provo a considerare anche un sar(1)
+L'acf presenta ancora della memoria su alcuni lag, che sembrano decrescere geometricamente.
+Inoltre la pacf presenta il primo ritardo stagionale (24) fuori dalle bande.<br>
+La lettura del grafico non è immediata, sembrerebbe appropriato aggiungere un sar(1):
+
+```{r}
+mod4=Arima(ltrain, order=c(2, 0, 0), seasonal=list(order=c(1, 1, 1), period=24))
+coeftest(mod4)
+```
+
+I coefficienti sono tutti significativi, compreso quello relativo al sar(1).
+```{r}
+acfpacf(mod4$residuals,400)
+```
+
+La situazione sul pacf è migliorata, il ritardo al lag 24 ora rientra nelle bande.<br>
+In entrambi i grafici qualche ritardo esce dalle bande, ma considerando che il livello di confidenza è al 95%  ciò è ammissibile.
+
+
+Creo una funzione per il confronto tra modelli arima:
+```{r}
+confronto=function(m1,m2){
+  print('statistiche primo modello')
+  print(capture.output(m1)[c(2,9,10)])
+  print('###########################################')
+  print('statistiche secondo modello:')
+  print(capture.output(m2)[c(2,9,10)])
+}
+
+confronto(mod3,mod4)
+```
+
+L'ultimo modello con sar(1) risulta di poco migliore del terzo.
+
+La funzione auto.arima fa una selezione stepwise dei modelli Arima migliori,
+ovvero che massimizzano la massima verosimiglianza. <br>
+Forzo il modello ad includere un'integrazione stagionale ponendo D=1.
+Non rieseguo la procedura sul markdown a causa dei tempi computazionali gravosi richiesti dall'algoritmo.
+
+```{r warning=FALSE}
+#autoAR=auto.arima(ftrain, D=1)  
+#il modello migliore trovato dall'auto.arima è un'ARIMA(3,0,1)(2,1,0)[24] 
+autoAR_model=Arima(ltrain, order=c(3, 0, 1), seasonal=list(order=c(2, 1, 0), period=24))
+
+confronto(autoAR_model,mod4)
+```
+Al contrario di quanto ci si possa aspettare il modello selezionato dall'auto.arima() è 
+decisamente peggio di mod4 in termini di AIC e log-likelihood.
+
+
+Scelgo quindi il modello ARIMA(2,0,0)(1,1,1)[24] per il successivo check e forecasting.
+
+```{r message=FALSE}
+checkresiduals(mod4,lag=300,plot=T)
+```
+
+Dal check i residui possono essere considerati normali, e quindi white noise.
+
+Forecasting:
+```{r message=FALSE, warning=FALSE}
+s_test=xts(test$Appliances,order.by=as.POSIXct(test$Date,format="%Y-%m-%d %H:%M:%S"))
+ltest=log(s_test)
+
+#prevedo i valori futuri, tanti quante sono le osservazioni del test
+forecast_arima=forecast(ltrain,h=dim(ltest)[1],model=mod4)
+autoplot(ts(forecast_arima$mean,start=dim(train)[1]), series='Forecast',main = 'Appliances - SARIMA',ylab="log(Energy)") +
+  autolayer(ts(log(train$Appliances)),series='Train') +
+  autolayer(ts(log(test$Appliances),start=dim(train)[1]),series='Test') +
+  scale_x_continuous(labels=c("Gennaio", "Febbraio", "Aprile",'Maggio'))
+```
+
+Dato che mi interessa prevedere i valori di energia originali, e non quelli log-trasformati, devo ritrasformare i valori previsti con la funzione esponenziale.
+In questo scenario la misura di errore ideale è il mean absolute error (MAE).
+Ipotizzo che la distribuzione di log(Appliances) segua approssimativamente una normale:
+
+```{r}
+ggqqplot(log(train$Appliances),main='log(Appliances) - Quantile Plot')
+```
+
+Calcolo il MAE su train e test:
+
+```{r}
+MAE(exp(forecast_arima$fitted),train$Appliances)
+MAE(exp(forecast_arima$mean),test$Appliances)
+```
+
+
+UCM
+
+Dalle analisi fatte con i modelli Arima e dai grafici è stato visto come la serie non segua un attrattore, ma rimanga costante attorno alla propria media. Di conseguenza si implementerà un modello in forma State Space con componente trend a varianza (del livello) nulla. <br>
+Verrà poi inclusa una componente stagionale (giornaliera) a varianza ignota, modellata con 23 dummies.
+La serie storica di riferimento da qui in poi sarà quella su scala naturale.
+
+```{r message=FALSE, warning=FALSE}
+mod7_kfas <- SSModel(s_train ~ 0 +
+                       SSMtrend(1, 0) + #local level
+                       SSMseasonal(24, NA, sea.type = "dummy"),
+                     H = NA)
+
+
+init7 <- c(
+  logvar_eps = log(100),
+  logvar_om = log(3)
+)
+
+updt7 <- function(pars, model) {
+  model$H[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2]) #disturbo dummies
+  model
+}
+
+fit7<- fitSSM(mod7_kfas, init7, updt7)
+
+fit7$optim.out$convergence
+
+round(exp(fit7$optim.out$par),3)
+
+```
+
+Il trend è costante, e coincide con la media del train:
+
+```{r fig.keep='last'}
+smo7 <- KFS(fit7$model,
+            smoothing = 'state')
+plot(s_train)
+mean(s_train)
+lines(xts(smo7$alphahat[, "level"],order.by=as.POSIXct(train$Date,format="%Y-%m-%d %H:%M:%S")),
+      col = "red")
+```
+
+La componente stagionale è praticamente deterministica:
+
+```{r}
+plot(smo7$alphahat[, "sea_dummy1"], type = "l")
+```
+
+
+
+```{r}
+kfas_pred=predict(fit7$model,n.ahead=dim(s_test)[1])
+
+autoplot(fitted(fit7$model), series='fitted',main = 'Appliances - UCM',ylab="Energy") +
+  xlim(c(0, 3288)) +
+  autolayer(ts(train$Appliances),series='Train') +
+  autolayer(ts(test$Appliances,start=dim(train)[1]), series='Test') +
+  autolayer(kfas_pred,series='Predicted')
+```
+
+Il modello, data anche la natura delle sue componenti, è di fatto deterministico.
+Le previsioni dell'UCM sono simili a quelle del modello ARIMA: il modello fatica a cogliere i numerosi picchi (positivi e negativi) della serie originale.
+
+Per cercare di prevedere meglio i picchi sono state considerate svariate configurazioni di modelli UCM; tra le più significative una con trend costante e due componenti stagionali, una giornaliera, l'altra quadrisettimanale:
+
+```{r kfas deg, message=FALSE, warning=FALSE}
+kfas_mod3 <- SSModel(s_train ~ 0 +
+                       SSMtrend(1, 0) + #1 corresponds to local level (random walk)
+                       SSMseasonal(24, NA, sea.type = "dummy") +
+                       SSMseasonal(672, NA, sea.type = "trig", harmonics=1:16), #metto un numero limitato di sinusoidi, 16,  
+                     H = NA)                                                    #come visto a lezione
+
+
+inits3<- c(
+  logvar_eps = log(100),
+  logvar_om = log(3), 
+  logvar_om2 = log(2)
+)
+
+updt3 <- function(pars, model) {
+  dq <- dim(model$Q)[1]
+  model$H[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2]) #disturbo dummies
+  diag(model$Q[3:dq, 3:dq, 1]) <- exp(pars[3]) #dq-3 disturbi per la 2a stag
+  model
+}
+
+fit3 <- fitSSM(kfas_mod3, inits3, updt3) 
+fit3$optim.out$convergence 
+
+
+round(exp(fit3$optim.out$par),3)
+
+
+smo3 <- KFS(fit3$model, smoothing='state')
+
+#plot stag. mensile
+plot(xts(rowSums(
+  smo3$alphahat[, paste0("sea_trig", 1:16)]),order.by=as.POSIXct(train$Date,format="%Y-%m-%d %H:%M:%S")),
+  type = "l",main='monthly seasonality') #
+plot(s_train)
+
+```
+
+
+
+La seconda componente stagionale riusciva a cogliere bene i picchi positivi e negativi, in particolare quelli di Gennaio.<br>
+La procedura di ottimizzazione del modello andava però a stimare varianze delle componenti enormi, e un modello finale degenere.
+Fissando le varianze a priori non infinite, ma su valori più contenuti, il risultato finale non cambiava.<br>
+Per questo si prende come modello UCM di riferimento il primo (fit7$model), con trend costante e stagionalità giornaliera.
+
+Calcolo il MAE su train e test:
+
+```{r}
+MAE(fitted(fit7$model),train$Appliances)
+MAE(kfas_pred,test$Appliances)
+```
+
+
+Machine Learning
+
+Per quanto riguarda la parte di machine learning sono stati utilizzati dei modelli KNN.
+La funzione knn_forecasting() permette in una sola riga di codice di specificare il modello
+KNN voluto e fare previsioni.
+Il pacchetto è stato reso disponibile agli utenti R di recente, il 31 maggio 2019.
+Per informazioni più dettagliate sull'algoritmo si rimanda al report e al seguente link:
+https://cran.r-project.org/web/packages/tsfknn/vignettes/tsfknn.html
+
+La funzione ha come argomenti principali:
+•	La serie da prevedere
+•	Il parametro h, ovvero il numero di step di previsione
+•	Lags: numero di lag utilizzati per la previsione
+•	Il parametro k, ovvero il numero di vicini da considerare
+•	Msas: la strategia di previsione utilizzata.
+
+
+Sono state provate differenti combinazioni di lags e k (numero di vicini).
+Vengono proposti i due modelli migliori:<br>
+-knn_m6, con k=3 e lags giornaliero;<br>
+-knn_m8, con k=3 e lag settimanale.
+
+```{r warning=FALSE, results = 'hide'}
+knn_m6=knn_forecasting(ts(s_train),h=dim(s_test)[1],lags=1:24,k=3, msas='recursive')
+
+```
+
+Plot della procedura di forecasting del modello knn_m6:
+
+```{r eval=F}
+autoplot(knn_m6, highlight = "neighbors", faceting = FALSE)
+```
+
+```{r eval=FALSE, include=FALSE}
+#l'autoplot generato da fnn_forecasting è ricorsivo e dà problemi col markdown.
+#esporto una delle figure plottate (con R script normale) e la reimporto 
+#nel markdown
+```
+
+
+```{r autoplot knn_m6,echo=FALSE, out.width = '100%'}
+knitr::include_graphics("C:\\Users\\Luca\\Desktop\\BICOCCA\\streaming & time series\\progetto\\autoplot knn_m6.png")
+```
+
+```{r }
+knn_m8=knn_forecasting(ts(s_train),h=dim(s_test)[1],lags=1:168, k=3, msas='recursive')
+```
+
+Plot della procedura di forecasting del modello knn_m8:
+
+```{r eval=F}
+autoplot(knn_m8, highlight = "neighbors", faceting = FALSE)
+```
+
+
+```{r plot knn_m8,echo=FALSE, out.width = '100%'}
+knitr::include_graphics("C:\\Users\\Luca\\Desktop\\BICOCCA\\streaming & time series\\progetto\\plot knn_m8.png")
+```
+
+Plot dei valori previsti vs reali:
+
+```{r}
+autoplot(knn_m8$prediction, series='Predicted',main = 'Appliances - KNN_m8',ylab="Energy") +
+  autolayer(ts(train$Appliances),series='Train') +
+  autolayer(ts(test$Appliances,start=dim(train)[1]), series='Test') +
+  scale_x_continuous(labels=c("Gennaio", "Febbraio", "Aprile",'Maggio'))
+```
+
+Graficamente le previsioni appaiono buone, anche se spesso i picchi previsti non si sovrappongono con quelli reali della serie.
+
+Confronto dei due modelli migliori con MAE:
+
+```{r}
+MAE(knn_m6$prediction,test$Appliances)
+MAE(knn_m8$prediction,test$Appliances)
+```
+
+Il modello knn migliore risulta quello con 168 lag.
